@@ -1,6 +1,6 @@
 # Emotion-aware responses from voice: a Text + Audio prototype on MELD
 
-A small, local, end-to-end prototype for a character robot: you speak one turn, and it returns **structured emotional state** (a MELD emotion category plus confidence) and a **short streamed reply grounded in what you said and how you said it**.
+A small, local, end-to-end prototype for a character robot: you speak one turn, and it returns **structured emotional state** (a MELD emotion category plus confidence) and a **short streamed reply grounded in what you said and how you said it. The demo below uses 2 wav files I recorded myself**.
 
 ```
 $ python3 scripts/main.py --replay samples/Happy.wav
@@ -251,8 +251,7 @@ Memory is reported as macOS *physical footprint*, which is what Activity Monitor
 
 **Trained in this repo:** the fusion head (`cache/fusion_model.pt`) and the text-only and audio-only baselines.
 
-**AI assistance:** Claude was used for coding help. It wrote `scripts/verify_data.py`, parts of `main.py`, `benchmark.py` and the recorder, and drafts of the experiment reports and this README. I reviewed and ran everything, and all numbers here come from runs in this repo.
-
+**AI assistance:** Claude was used. I mainly used claude to help organize and clean a lot of my code, for example I just wrote this README in txt format and had claude convert all of it to markdown. Claude also helped in structuring the project and helping me think through design choices.
 ---
 
 ## Repository layout
