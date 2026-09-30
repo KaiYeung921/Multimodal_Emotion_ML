@@ -1,127 +1,96 @@
-#i = 1003 is sadness confirmed
+"""End-to-end: audio -> Whisper + WavLM -> fusion emotion -> LLM reply.
 
+  python3 scripts/main.py --replay recording.wav
+  python3 scripts/main.py --record [out.wav]
+"""
+import argparse
+from math import gcd
 from pathlib import Path
-from models import FusionMLP
-import soundfile as sf
-from transformers import AutoFeatureExtractor, WavLMModel, AutoTokenizer, AutoModel
-import torch, numpy as np, pandas as pd, torch.nn as nn
-import mlx_whisper
 
+import mlx_whisper
+import numpy as np
+import soundfile as sf
+import torch
+from mlx_lm import load, stream_generate
+from scipy.signal import resample_poly
+from transformers import AutoFeatureExtractor, AutoModel, AutoTokenizer, WavLMModel
+
+from models import FusionMLP
+from transcribe import record_until_enter
 
 ROOT = Path(__file__).resolve().parent.parent
 CACHE = ROOT / "cache"
-DATA = ROOT / "data"
 EMOTIONS = ["neutral", "joy", "surprise", "anger", "sadness", "disgust", "fear"]
-manifest = pd.read_csv(DATA / "manifest.csv")
-i = 1003
-idx = pd.read_csv(CACHE / "index.csv")
+SR = 16000
 
-
-X = np.load(CACHE / "text.npy").astype(np.float32)
-X_audio = np.load(CACHE / "audio_wavlm_13L.npy").astype(np.float32).reshape(-1, 13, 1536)
-
-
-
-# Text Pipeline
-
-MODEL = 'roberta-base'
-BATCH = 64
-dev = "mps" if torch.backends.mps.is_available() else "cpu"
-
-tok = AutoTokenizer.from_pretrained(MODEL)
-enc = AutoModel.from_pretrained(MODEL).to(dev)
-enc.eval()
-
-def encode_text(text, tok, enc, dev):
-    b = tok(text, truncation=True, max_length=128, return_tensors="pt").to(dev)
-    with torch.no_grad():
-        h = enc(**b).last_hidden_state                      # [1, seq, 768]
-    m = b["attention_mask"].unsqueeze(-1).float()
-    return ((h * m).sum(1) / m.sum(1)).cpu()                # [1, 768]
-
-gold_text = manifest.Utterance[i]
-xt = encode_text(gold_text, tok, enc, dev)
-
-#Audio Pipeline
-
-
-wav, sr = sf.read(ROOT / manifest.audio_path[i], dtype="float32")   # row i's clip
-dev = "mps" if torch.backends.mps.is_available() else "cpu" 
-fe  = AutoFeatureExtractor.from_pretrained("microsoft/wavlm-base-plus")
-wlm = WavLMModel.from_pretrained("microsoft/wavlm-base-plus").eval().to(dev)
-
-inp = fe(wav, sampling_rate=16000, return_tensors="pt").to(dev)
-with torch.no_grad():
-    out = wlm(**inp, output_hidden_states=True)
-feats = [f for h in out.hidden_states for f in (h.mean(1), h.std(1))]
-xa = torch.cat(feats, 1).reshape(1, 13, 1536).cpu()
-
-def encode_audio(wav, fe, wlm, dev):
-    inp = fe(wav, sampling_rate=16000, return_tensors="pt").to(dev)
-    with torch.no_grad():
-        out = wlm(**inp, output_hidden_states=True)
-    feats = [f for h in out.hidden_states for f in (h.mean(1), h.std(1))]
-    return torch.cat(feats, 1).reshape(1, 13, 1536).cpu()
-
-
-#Whisper text transcription
+TEXT_ENC = "roberta-base"
+AUDIO_ENC = "microsoft/wavlm-base-plus"
 WHISPER = "mlx-community/whisper-base.en-mlx"
+LLM = "mlx-community/Qwen2.5-3B-Instruct-4bit"   # ~3.1B; project total ~3.4B (cap 6B)
+
+DEV = "mps" if torch.backends.mps.is_available() else "cpu"
+
+
+def load_models():
+    M = argparse.Namespace()
+    M.tok = AutoTokenizer.from_pretrained(TEXT_ENC)
+    M.enc = AutoModel.from_pretrained(TEXT_ENC).eval().to(DEV)
+    M.fe = AutoFeatureExtractor.from_pretrained(AUDIO_ENC)
+    M.wlm = WavLMModel.from_pretrained(AUDIO_ENC).eval().to(DEV)
+    M.fusion = FusionMLP(768, 1536, 13, len(EMOTIONS))
+    M.fusion.load_state_dict(torch.load(CACHE / "fusion_model.pt"))
+    M.fusion.eval()
+    M.llm, M.llm_tok = load(LLM)
+    return M
+
+
+def load_wav(path):
+    wav, sr = sf.read(path, dtype="float32")
+    if wav.ndim > 1:                          # stereo -> mono
+        wav = wav.mean(axis=1)
+    if sr != SR:                              # e.g. 44.1/48 kHz -> 16 kHz
+        g = gcd(SR, sr)
+        wav = resample_poly(wav, SR // g, sr // g).astype(np.float32)
+    return wav
+
+
 def transcribe(wav):
-    # wav: float32 numpy array, 16kHz, mono — same format everything else uses
-    result = mlx_whisper.transcribe(wav, path_or_hf_repo=WHISPER)
-    return result["text"].strip()
-
-w_text = transcribe(wav)
-xt_w = encode_text(w_text, tok, enc, dev)
+    return mlx_whisper.transcribe(wav, path_or_hf_repo=WHISPER)["text"].strip()
 
 
+def encode_text(text, M):
+    b = M.tok(text, truncation=True, max_length=128, return_tensors="pt").to(DEV)
+    with torch.no_grad():
+        h = M.enc(**b).last_hidden_state                      # [1, seq, 768]
+    m = b["attention_mask"].unsqueeze(-1).float()
+    return ((h * m).sum(1) / m.sum(1)).cpu()                  # [1, 768]
 
 
-m = FusionMLP(768, 1536, 13, 7)
-m.load_state_dict(torch.load(CACHE / "fusion_model.pt"))
-m.eval()
+def encode_audio(wav, M):
+    inp = M.fe(wav, sampling_rate=SR, return_tensors="pt").to(DEV)
+    with torch.no_grad():
+        out = M.wlm(**inp, output_hidden_states=True)
+    feats = [f for h in out.hidden_states for f in (h.mean(1), h.std(1))]
+    return torch.cat(feats, 1).reshape(1, 13, 1536).cpu()     # [1, 13, 1536]
 
 
+def classify(xt, xa, M):
+    with torch.no_grad():
+        probs = torch.softmax(M.fusion(xt, xa), 1)[0]
+    pred = probs.argmax().item()
+    return EMOTIONS[pred], probs[pred].item()
 
 
-# for i in range(1000, 1010):
-#     wav, _ = sf.read(manifest.audio_path[i], dtype="float32")
-#     xt = encode_text(manifest.Utterance[i], tok, enc, dev)
-#     xt_w  = encode_text(transcribe(wav), tok, enc, dev)
-#     xa      = encode_audio(wav, fe, wlm, dev)
-#     with torch.no_grad():
-#         pg = m(xt, xa).argmax(1).item()
-#         pw = m(xt_w, xa).argmax(1).item()
-#     print(f"{i}: gold {EMOTIONS[pg]} | whisper {EMOTIONS[pw]} | true {idx.iloc[i].Emotion}")
-
-# from sklearn.metrics import f1_score
-# dev_indices = np.where(manifest["split"] == "dev")[0]
-# EMO2ID = {e: i for i, e in enumerate(EMOTIONS)}
-# manifest["emo_id"] = manifest["Emotion"].map(EMO2ID)
+def compute_prosody(wav):
+    return {"rms": float(np.sqrt(np.mean(wav ** 2))), "duration_s": len(wav) / SR}
 
 
-# gold_pred, asr_pred, y = [], [], []
-# for i in dev_indices:
-#     wav, _ = sf.read(manifest.audio_path[i], dtype="float32")
-#     xa = encode_audio(wav, fe, wlm, dev)
-#     xt_g = encode_text(manifest.Utterance[i], tok, enc, dev)
-#     xt_a = encode_text(transcribe(wav) or "[unclear]", tok, enc, dev)
-#     with torch.no_grad():
-#         gold_pred.append(m(xt_g, xa).argmax(1).item())
-#         asr_pred.append(m(xt_a, xa).argmax(1).item())
-#     y.append(manifest.iloc[i].emo_id)
-
-# print("gold  wF1", f1_score(y, gold_pred, average="weighted"))
-# print("asr   wF1", f1_score(y, asr_pred, average="weighted"))
+def describe_prosody(p):
+    loud = "raised volume" if p["rms"] > 0.05 else "low volume"
+    return f"{loud}, {p['duration_s']:.1f}s"
 
 
-#llm response
-
-from mlx_lm import load, stream_generate
-
-llm, llm_tok = load("mlx-community/Qwen2.5-3B-Instruct-4bit")   # ~3.1B; project total ~3.4B (cap 6B)
-
-def build_prompt(state, llm_tok):
+def build_prompt(state, M):
     # tone goes in the system prompt; the user turn is only what they said,
     # so the model replies to the person instead of describing them
     system = (
@@ -130,42 +99,45 @@ def build_prompt(state, llm_tok):
         "Reply to them directly in one short sentence, speaking as 'you'. "
         "Do not describe them, do not name their emotion."
     )
-    user = state["transcript"]
     messages = [{"role": "system", "content": system},
-                {"role": "user", "content": user}]
-    return llm_tok.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+                {"role": "user", "content": state["transcript"]}]
+    return M.llm_tok.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
 
-def compute_prosody(wav, sr):
-    return {"rms": float(np.sqrt(np.mean(wav ** 2))), "duration_s": len(wav) / sr}
 
-def describe_prosody(p):
-    loud = "raised volume" if p["rms"] > 0.05 else "low volume"
-    return f"{loud}, {p['duration_s']:.1f}s"
-
-def generate(prompt, llm, llm_tok, max_tokens=40):
+def generate(prompt, M, max_tokens=40):
     response = ""
-    for chunk in stream_generate(llm, llm_tok, prompt, max_tokens=max_tokens):
+    for chunk in stream_generate(M.llm, M.llm_tok, prompt, max_tokens=max_tokens):
         print(chunk.text, end="", flush=True)   # live streaming to terminal
         response += chunk.text
     print()
     return response
 
 
-with torch.no_grad():
-    probs = torch.softmax(m(xt_w, xa), 1)[0]      # Whisper text + audio, no gold text
-pred = probs.argmax().item()
+def run(wav, M):
+    text = transcribe(wav) or "[unclear]"       # silence -> Whisper returns ""
+    emotion, conf = classify(encode_text(text, M), encode_audio(wav, M), M)
+    state = {"transcript": text, "emotion": emotion, "confidence": conf,
+             "prosody": compute_prosody(wav)}
+
+    print(f"whisper: {text}")
+    print(f"pred: {emotion} ({conf:.2f}) | {describe_prosody(state['prosody'])}")
+    print("llm: ", end="")
+    return generate(build_prompt(state, M), M)
 
 
-state = {
-    "transcript": w_text,                     # from Whisper
-    "emotion": EMOTIONS[pred],                # from your model, not hardcoded
-    "confidence": probs[pred].item(),
-    "prosody": compute_prosody(wav, sr),      # raw numbers; build_prompt describes them
-}
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    g = ap.add_mutually_exclusive_group(required=True)
+    g.add_argument("--replay", metavar="WAV", help="run on an existing audio file")
+    g.add_argument("--record", nargs="?", const="recording.wav", metavar="OUT",
+                   help="record from the mic (Enter to stop), save to OUT, then run")
+    args = ap.parse_args()
 
-print(f"utterance {i} | true {manifest.Emotion[i]}")
-print(f"whisper: {w_text}")
-print(f"pred: {state['emotion']} ({state['confidence']:.2f}) | {describe_prosody(state['prosody'])}")
-print("llm: ", end="")
-response = generate(build_prompt(state, llm_tok), llm, llm_tok)
+    M = load_models()                           # before recording, so the reply isn't delayed
+    if args.record:
+        record_until_enter(args.record, sample_rate=SR)
+    run(load_wav(args.record or args.replay), M)
 
+
+if __name__ == "__main__":
+    main()
