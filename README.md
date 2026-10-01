@@ -1,6 +1,6 @@
 # Emotion-aware responses from voice: a Text + Audio prototype on MELD
 
-A small, local, end-to-end prototype for a character robot: you speak one turn, and it returns **structured emotional state** (a MELD emotion category plus confidence) and a **short streamed reply grounded in what you said and how you said it. The demo below uses 2 wav files I recorded myself**.
+This project was made for an internship application! The goal of the project was to take 2 modalites (audio & text) as input and use them together to predict sentiment and emotion. All the training was done on the MELD dataset that converted and labeled "Friends(Show)" transcripts. A small, local, end-to-end prototype for a character robot: you speak one turn, and it returns **structured emotional state** (a MELD emotion category plus confidence) and a **short streamed reply grounded in what you said and how you said it. The demo below uses 2 wav files I recorded myself**.
 
 ```
 $ python3 scripts/main.py --replay samples/Happy.wav
