@@ -115,11 +115,11 @@ The LLM decodes at about 33 tokens/s. **Caveat:** each `main.py` run is a new pr
 
 All models use the same classifier head and training recipe: AdamW (lr 1e-4, wd 1e-2), BatchNorm + Dropout 0.5, class weights of 1/√count, and early stopping. The text and audio encoders are frozen, and only the head is trained. The splits are MELD's official train (9,988), dev (1,108) and test (2,610).
 
-| Model | dev wF1 | dev mF1 | **test wF1** | **test mF1** |
-|---|---:|---:|---:|---:|
-| Text only (RoBERTa, bare utterance) | 0.574 | 0.44 | — | — |
-| Audio only (WavLM, 13 layers) | 0.439 | 0.30 | — | — |
-| **Fusion (text + audio)** | **0.609** | **0.47** | **0.618** | **0.45** |
+| Model | test wF1 | test mF1 | 
+|---|---:|---:|
+| Text only (RoBERTa, bare utterance) | 0.574 | 0.44 |
+| Audio only (WavLM, 13 layers) | 0.439 | 0.30 | 
+| **Fusion (text + audio)** | **0.609** | **0.47** | 
 
 wF1 is weighted F1 and mF1 is macro F1. Dev was used for early stopping, so **test is the unbiased number**. The single-modality baselines were only evaluated on dev.
 
@@ -187,7 +187,7 @@ Memory is reported as macOS *physical footprint*, which is what Activity Monitor
 | **Qwen2.5-3B-Instruct, 4-bit** | Tested 0.5B, 1.5B and 3B with the same prompt. 0.5B described the speaker instead of replying, and 1.5B gave generic replies. 3B is the smallest that engaged with the content. 4-bit keeps it at about 2 GB. | About 0.5 s to the first token, and it uses 91% of the parameter budget. |
 | **Tone in the system prompt, transcript as the user turn** | When the transcript was quoted inside a report-style prompt, the LLM described the person instead of replying to them. | The reply relies on a classifier label that may be wrong. |
 | **MLX for Whisper + LLM, PyTorch/MPS for the encoders** | MLX is the fastest local option on Apple Silicon. The encoders are standard `transformers` models. | Two frameworks, and the project is tied to Apple Silicon. |
-| **Recorder in a child process** | Stopping a PortAudio mic stream on macOS sometimes deadlocks inside CoreAudio. The child writes the wav file and exits without stopping the stream. | One extra process start per recording. |
+
 
 ---
 
